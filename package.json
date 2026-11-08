@@ -1,0 +1,15 @@
+{
+  "name": "signal-lead-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env server/index.js",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check server/index.js && node --check server/app.js && node --check server/providers.js && node --check server/ads.js && node --check server/geo.js && node --check public/app.js && node --check public/tracker.js && node --check public/publisher.js"
+  }
+}
