@@ -10,6 +10,6 @@
     "dev": "node --watch --env-file-if-exists=.env server/index.js",
     "start": "node --env-file-if-exists=.env server/index.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server/index.js && node --check server/app.js && node --check server/providers.js && node --check server/ads.js && node --check server/geo.js && node --check public/app.js && node --check public/tracker.js && node --check public/publisher.js"
+    "check": "node --check server/index.js && node --check server/app.js && node --check server/providers.js && node --check server/consumers.js && node --check server/ads.js && node --check server/geo.js && node --check public/app.js && node --check public/consumers-ui.js && node --check public/tracker.js && node --check public/publisher.js"
   }
 }

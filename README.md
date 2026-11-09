@@ -56,6 +56,10 @@ Call this only in your consent manager's approval callback, not unconditionally 
 
 The tracker creates a session-scoped random subject ID only after permission. It respects Global Privacy Control, sends no query string or URL fragment as the page URL, and sends no existing first-party email automatically. A signed attribution parameter is passed separately and linked only within the same client workspace. The server observes the connection IP; callers cannot provide a replacement IP in the event body. Only an explicitly configured trusted proxy may supply `X-Real-IP`.
 
+## Customer-owned enrichment
+
+The **Consumers** directory now supports manual entry, atomic CSV/JSON CRM imports, per-field provenance, authenticated form-to-session associations, local record enrichment, and contact-wide suppression/erasure. It requires no identity-provider service. Start with [the enrichment guide](ENRICHMENT.md) for the workflow and API examples.
+
 ## Consumer identity with minimal third parties
 
 Two supported architectural paths:
@@ -132,7 +136,7 @@ The MVP prepares offers asynchronously. **Live sends are explicit dashboard acti
 
 To enable real delivery, configure `OUTREACH_URL`, `OUTREACH_KEY`, `SENDER_POSTAL_ADDRESS`, and `ENABLE_DELIVERY=true`. The HTTPS gateway receives `{offerId,to,subject,text,unsubscribeUrl,headers}` with `Idempotency-Key: <offerId>` and must durably honor that key. Return `{ "accepted": true }` only after durable acceptance.
 
-Delivery rechecks person match, >=90% reported confidence, matching email permission, valid email result, active offer rules, and suppressions. Messages include advertisement identification, sender postal address, and unsubscribe information. The unsubscribe endpoint accepts confirmation POST and one-click POST. Uncertain or interrupted sends are held for provider reconciliation; they are not blindly retried. Acceptance is not inbox-delivery confirmation. SMS sending is not implemented.
+Delivery rechecks a current customer-provided association or an eligible graph person match (>=90% provider-reported confidence), matching email permission, valid email result, active offer rules, and suppressions. Customer-provided records carry no probability score and are not marked verified by import. Messages include advertisement identification, sender postal address, and unsubscribe information. The unsubscribe endpoint accepts confirmation POST and one-click POST. Uncertain or interrupted sends are held for provider reconciliation; they are not blindly retried. Acceptance is not inbox-delivery confirmation. SMS sending is not implemented.
 
 ### Consent-aware ad and pixel endpoints
 
@@ -160,7 +164,7 @@ The app binds to `127.0.0.1` by default. Before any deployment, set a strong `AD
 
 SQLite/WAL and its parent directory are restricted to the local owner. Pending raw-IP lookup payloads use AES-256-GCM. **The complete database is not encrypted:** matched contacts and browser consent receipts are readable to the database owner. Use encrypted storage and backups for production. Preserve `DATA_SECRET` or the local `.data/secret` across restarts; changing it breaks queued payloads, existing receipts, and suppression hashes. Local files and `.env` are ignored by Git.
 
-`RETENTION_DAYS` defaults to 90 for visitor/contact history and audit events. Cleanup runs at startup and hourly. Ad ledger/campaign retention is intentionally separate and is not automatically purged; define financial/audit retention before production. Erasure removes a visitor's events, jobs, offers, and contact record but retains keyed subject/email suppression to prevent re-append. Suppressions must be retained and backed up; restoring an old backup must not resurrect opted-out contacts.
+`RETENTION_DAYS` defaults to 90 for visitor/contact history and audit events. Cleanup runs at startup and hourly. Ad ledger/campaign retention is intentionally separate and is not automatically purged; define financial/audit retention before production. Erasure removes a visitor's events, jobs, offers, and contact record but retains keyed subject/email suppression to prevent re-append. For a visitor linked to an owned consumer record, it also erases that directory record and related sessions. Customer-directory records/history are retained until explicit erasure; visitor retention unlinks expired sessions. Suppressions must be retained and backed up; restoring an old backup must not resurrect opted-out contacts.
 
 ## Relevant primary sources
 

@@ -15,13 +15,13 @@
     const id=subject();if(!id)return;
     const params=new URL(location.href).searchParams;
     const source=(params.get('utm_source')||'direct').replace(/[^a-z0-9_-]/gi,'').slice(0,64);
-    fetch(origin+'/collect?site='+encodeURIComponent(site),{
+    return fetch(origin+'/collect?site='+encodeURIComponent(site),{
       method:'POST',mode:'cors',credentials:'omit',keepalive:true,headers:{'Content-Type':'application/json'},
       body:JSON.stringify({subjectId:id,eventId:crypto.randomUUID(),url:location.origin+location.pathname,source,attribution:params.get('signal_click'),consent:permission,gpc:false}),
-    }).catch(()=>{});
+    }).then(response=>response.ok?response.json():null).catch(()=>null);
   }
   window.Signal={
-    consent(value){permission=value?.collection===true&&typeof value.noticeVersion==='string'?{collection:true,noticeVersion:value.noticeVersion,emailReceipt:value.emailReceipt||null}:null;if(permission)track();},
+    consent(value){permission=value?.collection===true&&typeof value.noticeVersion==='string'?{collection:true,noticeVersion:value.noticeVersion,emailReceipt:value.emailReceipt||null}:null;if(permission)return track();},
     track,
     getSubjectId(){return permission?.collection && navigator.globalPrivacyControl !== true ? subject() : null;},
     revoke(){permission=null;try{sessionStorage.removeItem(storageKey);}catch{}},

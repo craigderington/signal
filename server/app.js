@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtures, resolveIdentity, validateContact, validateGeofence, geojson, gateway } from './providers.js';
 import { createAdEngine } from './ads.js';
+import { createConsumerStore } from './consumers.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const now = () => new Date().toISOString();
@@ -92,7 +93,21 @@ export function createApp(options = {}) {
   const get = (sql, ...params) => db.prepare(sql).get(...params);
   const all = (sql, ...params) => db.prepare(sql).all(...params);
   const audit = (workspace, action, detail) => run('INSERT INTO audit VALUES(?,?,?,?,?)', randomUUID(), workspace, action, detail, now());
-  const transaction = callback => { db.exec('BEGIN IMMEDIATE'); try { const r = callback(); db.exec('COMMIT'); return r; } catch (error) { db.exec('ROLLBACK'); throw error; } };
+  let transactionDepth = 0;
+  const transaction = callback => {
+    const depth = transactionDepth++;
+    const savepoint = `nested_${depth}`;
+    try {
+      db.exec(depth ? `SAVEPOINT ${savepoint}` : 'BEGIN IMMEDIATE');
+      const result = callback();
+      db.exec(depth ? `RELEASE ${savepoint}` : 'COMMIT');
+      return result;
+    } catch (error) {
+      if (depth) { db.exec(`ROLLBACK TO ${savepoint}`); db.exec(`RELEASE ${savepoint}`); }
+      else db.exec('ROLLBACK');
+      throw error;
+    } finally { transactionDepth--; }
+  };
   // The configured token authenticates only the bootstrap workspace; others use distinct tokens.
   const existing = get('SELECT id FROM workspaces WHERE id=?', 'default');
   if (!existing) run('INSERT INTO workspaces VALUES(?,?,?)', 'default', 'Your workspace', hash(config.adminToken));
@@ -115,14 +130,20 @@ export function createApp(options = {}) {
   const suppressed = (workspace, kind, value) => Boolean(get('SELECT 1 FROM suppressions WHERE workspace_id=? AND kind=? AND value=?', workspace, kind, opaque(workspace, value)));
   function suppress(workspace, visitor) {
     run('INSERT OR IGNORE INTO suppressions VALUES(?,?,?,?)', workspace, 'subject', visitor.subject_key, now());
-    if (visitor.person) { const p = parse(visitor.person); if (p.email) run('INSERT OR IGNORE INTO suppressions VALUES(?,?,?,?)', workspace, 'email', opaque(workspace, p.email.toLowerCase()), now()); }
+    const linkedConsumer = consumers.forVisitor(workspace, visitor.id);
+    if (linkedConsumer) consumers.suppressEmail(workspace, linkedConsumer.email);
+    if (visitor.person) {
+      const p = parse(visitor.person);
+      if (p.email) run('INSERT OR IGNORE INTO suppressions VALUES(?,?,?,?)', workspace, 'email', opaque(workspace, p.email.toLowerCase()), now());
+      if (emailValid(p.email)) consumers.suppressEmail(workspace, p.email);
+    }
     run("UPDATE visitors SET status='suppressed' WHERE id=? AND workspace_id=?", visitor.id, workspace);
     run("UPDATE offers SET status='blocked',reason='Contact opted out or was suppressed' WHERE visitor_id=? AND status NOT IN ('sent','simulated_sent','sending','delivery_uncertain')", visitor.id);
     run("UPDATE jobs SET status='cancelled',payload=NULL WHERE visitor_id=? AND status IN ('queued','processing')", visitor.id);
   }
-  async function body(req) {
+  async function body(req, limit = 24000) {
     let chunks = ''; let size = 0;
-    for await (const chunk of req) { size += chunk.length; if (size > 24000) fail(413, 'Request is too large'); chunks += chunk; }
+    for await (const chunk of req) { size += chunk.length; if (size > limit) fail(413, 'Request is too large'); chunks += chunk; }
     try { const value = JSON.parse(chunks); if (!value || typeof value !== 'object' || Array.isArray(value)) fail(400,'Expected a JSON object'); return value; } catch (error) { if (error.status) throw error; fail(400, 'Invalid JSON'); }
   }
   function workspace(req) {
@@ -148,12 +169,14 @@ export function createApp(options = {}) {
     if (duplicate) return { accepted: true, duplicate: true, eventId: duplicate.id };
     let page;
     try { const u = new URL(input.url); if (u.origin !== site.origin) fail(400, 'Event URL does not match registered site'); page = u.pathname.slice(0, 300); } catch (error) { if (error.status) throw error; fail(400,'Invalid page URL'); }
-    const consent = { collection: true, noticeVersion: text(input.consent.noticeVersion, 100), recordedAt: now(), emailReceipt: typeof input.consent.emailReceipt === 'string' ? input.consent.emailReceipt.slice(0, 4000) : null };
     const found = get('SELECT * FROM visitors WHERE site_id=? AND subject_key=?',site.id,subjectKey);
+    const consent = { collection: true, noticeVersion: text(input.consent.noticeVersion, 100), recordedAt: now(), emailReceipt: typeof input.consent.emailReceipt === 'string' ? input.consent.emailReceipt.slice(0, 4000) : found ? parse(found.consent).emailReceipt : null };
     const visitorId = found?.id || randomUUID(); const eventId = randomUUID(); const timestamp = now();
     const pending = get("SELECT 1 FROM jobs WHERE visitor_id=? AND status IN ('queued','processing')",visitorId);
     const receiptChanged = found && consent.emailReceipt && consent.emailReceipt !== parse(found.consent).emailReceipt;
-    const shouldResolve = !pending && (!found || found.status === 'unmatched' || found.status === 'error' || Boolean(receiptChanged));
+    const ownedContact = found && consumers.forVisitor(site.workspace_id, found.id);
+    const ownedChanged = ownedContact && !consumers.isCurrentAssociation(site.workspace_id, found.id, found.person ? parse(found.person) : null);
+    const shouldResolve = !pending && (!found || found.status === 'unmatched' || found.status === 'error' || Boolean(receiptChanged) || Boolean(ownedChanged));
     const attributed = verify(input.attribution);
     const click = attributed?.purpose === 'attribution' && attributed.workspaceId === site.workspace_id ? get("SELECT campaign_id,id FROM ad_ledger WHERE id=? AND workspace_id=? AND status='shown' AND click_at IS NOT NULL",attributed.ledgerId,site.workspace_id) : null;
     const payload = { ip: ipOf(req), subjectId: input.subjectId, siteId: site.id, timestamp, collectionConsent: { collection: true, noticeVersion: consent.noticeVersion }, demo, fixture: input.fixture || 0 };
@@ -168,6 +191,60 @@ export function createApp(options = {}) {
     });
     return { accepted: true, eventId, visitorId };
   }
+  const consumers = createConsumerStore({ db, opaque, audit, transaction, body, identify: identifyOwnedVisitor, reEnrich: queueOwnedEnrichment, receiptEmail: value => verify(value)?.email || null });
+  function queueOwnedEnrichment(workspaceId, visitorId) {
+    const visitor = get('SELECT * FROM visitors WHERE id=? AND workspace_id=?', visitorId, workspaceId);
+    if (!visitor) fail(404, 'Visitor not found');
+    if (visitor.status === 'suppressed') fail(409, 'Visitor is suppressed');
+    const person = consumers.matchVisitor(workspaceId, visitor.id);
+    if (!person) fail(409, 'Associate an active customer record before refreshing this visitor');
+    return transaction(() => {
+      run("UPDATE jobs SET status='cancelled',payload=NULL WHERE visitor_id=? AND workspace_id=? AND status IN ('queued','processing')", visitor.id, workspaceId);
+      const jobId = randomUUID(), timestamp = now();
+      const event = get('SELECT id FROM events WHERE visitor_id=? ORDER BY created DESC LIMIT 1', visitor.id);
+      run('INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)', jobId, workspaceId, visitor.id, event?.id || randomUUID(), seal({ siteId: visitor.site_id, timestamp, firstParty: true, demo: false }), 'queued', 0, Date.now(), null, timestamp, null);
+      run("UPDATE visitors SET status='queued' WHERE id=?", visitor.id);
+      run("UPDATE offers SET status='blocked',reason='Customer record refresh in progress' WHERE visitor_id=? AND status IN ('ready','blocked')", visitor.id);
+      return { visitorId: visitor.id, consumerId: person.consumerId, jobId, status: 'queued' };
+    });
+  }
+  function identifyOwnedVisitor(workspaceId, input) {
+    let visitor;
+    if (input.visitorId) visitor = get('SELECT * FROM visitors WHERE id=? AND workspace_id=?', input.visitorId, workspaceId);
+    else {
+      if (typeof input.subjectId !== 'string' || input.subjectId.length < 8 || input.subjectId.length > 120) fail(400, 'Provide the consented tracker subjectId or visitorId');
+      visitor = get('SELECT * FROM visitors WHERE site_id=? AND subject_key=? AND workspace_id=?', input.siteId, opaque(workspaceId, input.subjectId), workspaceId);
+    }
+    if (!visitor) fail(404, 'Track a consented visit in this workspace before identifying the session');
+    const site = get('SELECT * FROM sites WHERE id=? AND workspace_id=?', visitor.site_id, workspaceId);
+    if (site.demo) fail(409, 'Synthetic demo visitors cannot be linked to customer records');
+    if (visitor.status === 'suppressed') fail(409, 'Visitor is suppressed');
+    const originalConsent = parse(visitor.consent);
+    if (originalConsent.collection !== true) fail(409, 'Collection permission is required');
+    const source = input.source || { type: 'manual', name: 'Dashboard association' };
+    if (!['manual', 'form'].includes(source.type) || typeof source.name !== 'string' || !source.name.trim() || source.name.length > 120) fail(400, 'Identification needs a named form or manual source');
+    return transaction(() => {
+      let consumer;
+      if (input.consumerId) {
+        consumer = consumers.find(workspaceId, input.consumerId);
+        if (!consumer) fail(404, 'Consumer not found in this workspace');
+      } else {
+        consumer = consumers.upsert(workspaceId, input.contact, source).consumer;
+      }
+      consumers.link(workspaceId, visitor, consumer, { type: source.type, name: source.name.trim(), recordedAt: now() });
+      if (input.consent?.emailMarketing === true) {
+        const notice = input.consent.noticeVersion;
+        if (typeof notice !== 'string' || !notice.trim() || notice.length > 100) fail(400, 'Email permission requires its noticeVersion');
+        const receipt = token({ purpose: 'email_consent', workspaceId, siteId: site.id, subject: visitor.subject_key, email: consumer.email,
+          notice, source: source.name.trim(), demo: false, recordedAt: now(), exp: Date.now() + 30 * 86400000 });
+        run('UPDATE visitors SET consent=? WHERE id=?', JSON.stringify({ ...originalConsent, emailReceipt: receipt }), visitor.id);
+        audit(workspaceId, 'First-party email permission recorded', 'Authenticated customer submission; receipt bound to this session and contact');
+      }
+      const result = queueOwnedEnrichment(workspaceId, visitor.id);
+      audit(workspaceId, 'Customer session associated', 'Exact customer-provided association; no IP-based identity inference');
+      return { ...result, method: 'customer_provided', emailPermissionRecorded: input.consent?.emailMarketing === true };
+    });
+  }
   let workerBusy = false;
   let closing = false;
   async function processJob() {
@@ -179,8 +256,12 @@ export function createApp(options = {}) {
     try {
       const payload = unseal(job.payload);
       const site = get('SELECT * FROM sites WHERE id=?',payload.siteId);
-      const person = await identityResolver(payload,config);
       let visitor = get('SELECT * FROM visitors WHERE id=?',job.visitor_id);
+      if (!visitor || visitor.status === 'suppressed' || get('SELECT status FROM jobs WHERE id=?',job.id)?.status === 'cancelled') return;
+      const owned = consumers.matchVisitor(job.workspace_id, visitor.id);
+      if (payload.firstParty && !owned) throw new Error('Identity association is no longer available');
+      const person = owned || await identityResolver(payload,config);
+      visitor = get('SELECT * FROM visitors WHERE id=?',job.visitor_id);
       if (!visitor || visitor.status === 'suppressed' || get('SELECT status FROM jobs WHERE id=?',job.id)?.status === 'cancelled') return;
       if (!person) {
         run("UPDATE visitors SET status='unmatched' WHERE id=?",visitor.id);
@@ -196,6 +277,8 @@ export function createApp(options = {}) {
         const validation = await contactValidator(person,payload.demo,config);
         visitor = get('SELECT * FROM visitors WHERE id=?',job.visitor_id);
         if (!visitor || visitor.status === 'suppressed' || get('SELECT status FROM jobs WHERE id=?',job.id)?.status === 'cancelled') return;
+        if (person.method === 'customer_provided' && !consumers.isCurrentAssociation(job.workspace_id,visitor.id,person)) throw new Error('Identity association changed during validation');
+        const customerProvided = consumers.isCurrentAssociation(job.workspace_id,visitor.id,person);
         const isSuppressed = person.email && suppressed(job.workspace_id,'email',person.email.toLowerCase());
         const consent = parse(visitor.consent);
         const receipt = verify(consent.emailReceipt);
@@ -204,7 +287,7 @@ export function createApp(options = {}) {
         const reasons = [];
         if (isSuppressed) reasons.push('Contact is on the suppression list');
         if (person.scope !== 'person') reasons.push('Match identifies a household, not an individual');
-        if (person.confidence < 0.9) reasons.push('Match confidence is below 90%');
+        if (!customerProvided && (!Number.isFinite(person.confidence) || person.confidence < 0.9)) reasons.push('Match confidence is below 90%');
         if (!emailValid(person.email)) reasons.push('No usable email address');
         if (!permitted) reasons.push('No matching first-party email marketing consent receipt');
         if (!['valid','demo_valid'].includes(validation.email)) reasons.push('Email has not passed validation');
@@ -216,7 +299,7 @@ export function createApp(options = {}) {
         transaction(() => {
           run('UPDATE visitors SET person=?,validation=?,status=? WHERE id=?',JSON.stringify(person),JSON.stringify(validation),isSuppressed ? 'suppressed' : 'matched',visitor.id);
           run("INSERT INTO offers VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(visitor_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,subject=excluded.subject,body=excluded.body,elapsed_ms=excluded.elapsed_ms WHERE offers.status IN ('blocked','ready')",offerId,job.workspace_id,visitor.id,reasons.length ? 'blocked' : payload.demo ? 'simulated_sent' : 'ready',reasons.join('; ') || (payload.demo ? 'Simulated delivery. No email or SMS sent.' : 'Eligible for configured delivery'),personalize(campaign.subject),personalize(campaign.body),now(),elapsed);
-          audit(job.workspace_id,'Identity matched',`${person.provider}: ${person.scope} match; ${Math.round(person.confidence*100)}% reported confidence`);
+          audit(job.workspace_id,'Identity matched',customerProvided ? 'Customer-owned record associated; identity is customer-provided, without a probability score' : `${person.provider}: ${person.scope} match; ${Math.round(person.confidence*100)}% reported confidence`);
         });
       }
       run("UPDATE jobs SET status='completed',payload=NULL,completed=?,error=NULL WHERE id=? AND status!='cancelled'",now(),job.id);
@@ -232,7 +315,7 @@ export function createApp(options = {}) {
     } finally { workerBusy = false; }
   }
   function publicVisitor(v) {
-    return { ...v, person: v.person ? parse(v.person) : null, validation: v.validation ? parse(v.validation) : null, consent: { ...parse(v.consent), emailReceipt: Boolean(parse(v.consent).emailReceipt) }, subject_key: undefined };
+    return { ...v, person: v.person ? parse(v.person) : null, validation: v.validation ? parse(v.validation) : null, consent: { ...parse(v.consent), emailReceipt: Boolean(parse(v.consent).emailReceipt) }, subject_key: undefined, consumerId: consumers.forVisitor(v.workspace_id,v.id)?.id || null };
   }
   function base(req) {
     if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/,'');
@@ -279,7 +362,7 @@ export function createApp(options = {}) {
         const receipt = verify(url.searchParams.get('token'));
         if (!receipt || receipt.purpose !== 'unsubscribe') fail(400,'This unsubscribe link is invalid or expired');
         if (method === 'POST') {
-          run('INSERT OR IGNORE INTO suppressions VALUES(?,?,?,?)',receipt.workspaceId,'email',opaque(receipt.workspaceId,receipt.email),now());
+          transaction(() => consumers.suppressEmail(receipt.workspaceId,receipt.email));
           for (const visitor of all('SELECT * FROM visitors WHERE workspace_id=? AND person IS NOT NULL',receipt.workspaceId)) if (parse(visitor.person).email.toLowerCase() === receipt.email) suppress(receipt.workspaceId,visitor);
           audit(receipt.workspaceId,'Unsubscribed','Email suppressed from future offers');
           res.writeHead(200,{'Content-Type':'text/html'});return res.end('<!doctype html><html lang="en"><title>Unsubscribed</title><body><h1>You are unsubscribed.</h1><p>You will receive no further offers from this workspace.</p></body></html>');
@@ -299,6 +382,7 @@ export function createApp(options = {}) {
         const w = workspace(req); if (!w) fail(401,'Sign in with your workspace token');
         rate(`admin:${w.id}`,600);
         if (mutate && !String(req.headers['content-type'] || '').startsWith('application/json')) fail(415,'Use application/json');
+        if (await consumers.handle(req,res,url,w)) return;
         if (route === '/api/logout' && method === 'POST') {
           const sid = req.headers.cookie?.split(';').map(s=>s.trim()).find(s=>s.startsWith('signal_session='))?.slice(15);
           if (sid) run('DELETE FROM sessions WHERE id=?',hash(sid));
@@ -308,7 +392,7 @@ export function createApp(options = {}) {
           const visitors = all('SELECT v.*,s.name site_name,s.demo FROM visitors v JOIN sites s ON s.id=v.site_id WHERE v.workspace_id=? ORDER BY v.last_seen DESC LIMIT 500',w.id).map(publicVisitor);
           const offers = all('SELECT o.*,v.person,s.demo FROM offers o JOIN visitors v ON v.id=o.visitor_id JOIN sites s ON s.id=v.site_id WHERE o.workspace_id=? ORDER BY o.created DESC LIMIT 500',w.id).map(o=>({...o,person:o.person ? parse(o.person):null}));
           const stats = get("SELECT count(*) visits,count(DISTINCT visitor_id) unique_visitors FROM events WHERE workspace_id=?",w.id);
-          return json(200,{advertising:ads.state(w.id),workspace:{id:w.id,name:w.name},sites:all('SELECT * FROM sites WHERE workspace_id=? ORDER BY created',w.id),visitors,offers,stats,campaign:get('SELECT * FROM campaigns WHERE workspace_id=?',w.id),geofences:all('SELECT * FROM geofences WHERE workspace_id=? ORDER BY created DESC',w.id).map(g=>({...g,plan:parse(g.plan)})),audit:all('SELECT * FROM audit WHERE workspace_id=? ORDER BY created DESC LIMIT 80',w.id),jobs:all('SELECT id,visitor_id,status,attempts,error,created,completed FROM jobs WHERE workspace_id=? ORDER BY created DESC LIMIT 100',w.id),config:{demo:config.localDemo,identityConfigured:Boolean(config.identityUrl&&config.identityKey),validationConfigured:Boolean(config.validationUrl&&config.validationKey),deliveryConfigured:Boolean(config.delivery&&config.outreachUrl&&config.outreachKey&&config.postalAddress),providerName:config.providerName,baseUrl:base(req)}});
+          return json(200,{consumers:consumers.list(w.id),consumerCount:get('SELECT count(*) n FROM consumers WHERE workspace_id=?',w.id).n,advertising:ads.state(w.id),workspace:{id:w.id,name:w.name},sites:all('SELECT * FROM sites WHERE workspace_id=? ORDER BY created',w.id),visitors,offers,stats,campaign:get('SELECT * FROM campaigns WHERE workspace_id=?',w.id),geofences:all('SELECT * FROM geofences WHERE workspace_id=? ORDER BY created DESC',w.id).map(g=>({...g,plan:parse(g.plan)})),audit:all('SELECT * FROM audit WHERE workspace_id=? ORDER BY created DESC LIMIT 80',w.id),jobs:all('SELECT id,visitor_id,status,attempts,error,created,completed FROM jobs WHERE workspace_id=? ORDER BY created DESC LIMIT 100',w.id),config:{demo:config.localDemo,identityConfigured:Boolean(config.identityUrl&&config.identityKey),validationConfigured:Boolean(config.validationUrl&&config.validationKey),deliveryConfigured:Boolean(config.delivery&&config.outreachUrl&&config.outreachKey&&config.postalAddress),providerName:config.providerName,baseUrl:base(req)}});
         }
         if (route === '/api/workspaces' && method === 'POST') {
           if (w.id !== 'default') fail(403,'Only the bootstrap administrator can provision workspaces');
@@ -356,15 +440,17 @@ export function createApp(options = {}) {
         if(geo){const g=get('SELECT * FROM geofences WHERE id=? AND workspace_id=?',geo[1],w.id);if(!g)fail(404,'Plan not found');if(method==='GET'&&geo[2])return json(200,geojson(parse(g.plan)),{'Content-Disposition':'attachment; filename="geofence.geojson"'});if(method==='DELETE'){if(get('SELECT 1 FROM ad_campaigns WHERE geofence_id=? AND workspace_id=?',g.id,w.id))fail(409,'Geofence is attached to an ad campaign');run('DELETE FROM geofences WHERE id=?',g.id);audit(w.id,'Geofencing plan deleted','Draft removed');return json(200,{ok:true});}}
         const detail=route.match(/^\/api\/visitors\/([^/]+)(\/suppress)?$/);
         if(detail){const v=get('SELECT * FROM visitors WHERE id=? AND workspace_id=?',detail[1],w.id);if(!v)fail(404,'Visitor not found');
-          if(method==='GET'&&!detail[2])return json(200,{visitor:publicVisitor(v),events:all('SELECT kind,page,source,created,campaign_id,ad_click_id FROM events WHERE visitor_id=? ORDER BY created DESC',v.id),offers:all('SELECT * FROM offers WHERE visitor_id=?',v.id),jobs:all('SELECT status,attempts,error,created,completed FROM jobs WHERE visitor_id=?',v.id)});
+          if(method==='GET'&&!detail[2])return json(200,{visitor:publicVisitor(v),consumer:consumers.forVisitor(w.id,v.id),events:all('SELECT kind,page,source,created,campaign_id,ad_click_id FROM events WHERE visitor_id=? ORDER BY created DESC',v.id),offers:all('SELECT * FROM offers WHERE visitor_id=?',v.id),jobs:all('SELECT status,attempts,error,created,completed FROM jobs WHERE visitor_id=?',v.id)});
           if(method==='POST'&&detail[2]){transaction(()=>suppress(w.id,v));audit(w.id,'Visitor suppressed','Future enrichment and offers blocked');return json(200,{ok:true});}
-          if(method==='DELETE'){transaction(()=>{suppress(w.id,v);run('DELETE FROM events WHERE visitor_id=?',v.id);run('DELETE FROM jobs WHERE visitor_id=?',v.id);run('DELETE FROM offers WHERE visitor_id=?',v.id);run('DELETE FROM visitors WHERE id=?',v.id);});audit(w.id,'Visitor erased','Contact and visit history removed; keyed suppression retained to prevent re-append');return json(200,{ok:true});}
+          if(method==='DELETE'){const owned=consumers.forVisitor(w.id,v.id);if(owned)return json(200,consumers.erase(w.id,owned.id));transaction(()=>{suppress(w.id,v);run('DELETE FROM events WHERE visitor_id=?',v.id);run('DELETE FROM jobs WHERE visitor_id=?',v.id);run('DELETE FROM offers WHERE visitor_id=?',v.id);run('DELETE FROM consumer_links WHERE visitor_id=?',v.id);run('DELETE FROM visitors WHERE id=?',v.id);});audit(w.id,'Visitor erased','Contact and visit history removed; keyed suppression retained to prevent re-append');return json(200,{ok:true});}
         }
         const deliver=route.match(/^\/api\/offers\/([^/]+)\/deliver$/);
         if(deliver&&method==='POST'){
           const o=get('SELECT * FROM offers WHERE id=? AND workspace_id=?',deliver[1],w.id);if(!o)fail(404,'Offer not found');if(o.status!=='ready')fail(409,'Offer is not eligible for delivery');
           const v=get('SELECT v.*,s.demo FROM visitors v JOIN sites s ON s.id=v.site_id WHERE v.id=?',o.visitor_id);const p=parse(v.person);const receipt=verify(parse(v.consent).emailReceipt);const validation=parse(v.validation);
-          if(v.demo||v.status==='suppressed'||suppressed(w.id,'email',p.email.toLowerCase())||!receipt||receipt.purpose!=='email_consent'||receipt.workspaceId!==w.id||receipt.siteId!==v.site_id||receipt.subject!==v.subject_key||receipt.email!==p.email.toLowerCase()||receipt.demo!==false||p.scope!=='person'||p.confidence<0.9||validation.email!=='valid'||!get('SELECT enabled FROM campaigns WHERE workspace_id=?',w.id).enabled)fail(409,'Contact is no longer eligible');
+          const customerProvided=consumers.isCurrentAssociation(w.id,v.id,p);
+          if(p.method==='customer_provided'&&!customerProvided)fail(409,'Customer record changed; refresh this visitor before delivery');
+          if(v.demo||v.status==='suppressed'||suppressed(w.id,'email',p.email.toLowerCase())||!receipt||receipt.purpose!=='email_consent'||receipt.workspaceId!==w.id||receipt.siteId!==v.site_id||receipt.subject!==v.subject_key||receipt.email!==p.email.toLowerCase()||receipt.demo!==false||p.scope!=='person'||(!customerProvided&&(!Number.isFinite(p.confidence)||p.confidence<0.9))||validation.email!=='valid'||!get('SELECT enabled FROM campaigns WHERE workspace_id=?',w.id).enabled)fail(409,'Contact is no longer eligible');
           if(!config.delivery||!config.outreachUrl||!config.outreachKey||!config.postalAddress)fail(409,'Configure a delivery gateway and sender postal address, then enable delivery');
           const unsubscribe=`${base(req)}/unsubscribe?token=${token({purpose:'unsubscribe',workspaceId:w.id,email:p.email.toLowerCase(),exp:Date.now()+365*86400000})}`;
           const claimed=run("UPDATE offers SET status='sending',reason='Delivery in progress' WHERE id=? AND status='ready'",o.id);if(!claimed.changes)fail(409,'Delivery already in progress');
@@ -377,7 +463,7 @@ export function createApp(options = {}) {
         fail(404,'Endpoint not found');
       }
       if(method!=='GET'&&method!=='HEAD')fail(405,'Method not allowed');
-      const assets={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/publisher':'publisher.html','/publisher.js':'publisher.js'};
+      const assets={'/':'index.html','/app.js':'app.js','/consumers-ui.js':'consumers-ui.js','/style.css':'style.css','/publisher':'publisher.html','/publisher.js':'publisher.js'};
       const asset=assets[route];if(!asset)fail(404,'Not found');
       const types={'.html':'text/html','.js':'text/javascript','.css':'text/css'};
       res.writeHead(200,{'Content-Type':types[path.extname(asset)]});res.end(method==='HEAD'?undefined:readFileSync(path.join(root,'public',asset)));
@@ -388,7 +474,7 @@ export function createApp(options = {}) {
   function cleanup(){
     run('DELETE FROM sessions WHERE expires<?',Date.now());
     const days=Math.max(1,Number(process.env.RETENTION_DAYS)||90);const cutoff=new Date(Date.now()-days*86400000).toISOString();
-    transaction(()=>{const ids=all('SELECT id FROM visitors WHERE last_seen<?',cutoff);for(const v of ids){run('DELETE FROM events WHERE visitor_id=?',v.id);run('DELETE FROM offers WHERE visitor_id=?',v.id);run('DELETE FROM jobs WHERE visitor_id=?',v.id);run('DELETE FROM visitors WHERE id=?',v.id);}run('DELETE FROM audit WHERE created<?',cutoff);});
+    transaction(()=>{const ids=all('SELECT id FROM visitors WHERE last_seen<?',cutoff);for(const v of ids){run('DELETE FROM events WHERE visitor_id=?',v.id);run('DELETE FROM offers WHERE visitor_id=?',v.id);run('DELETE FROM jobs WHERE visitor_id=?',v.id);run('DELETE FROM consumer_links WHERE visitor_id=?',v.id);run('DELETE FROM visitors WHERE id=?',v.id);}run('DELETE FROM audit WHERE created<?',cutoff);});
     run("UPDATE jobs SET status='failed',payload=NULL,error='Pending lookup expired' WHERE status='queued' AND created<?",new Date(Date.now()-86400000).toISOString());
   }
   cleanup();const retention=setInterval(cleanup,3600000);retention.unref();worker?.unref();
